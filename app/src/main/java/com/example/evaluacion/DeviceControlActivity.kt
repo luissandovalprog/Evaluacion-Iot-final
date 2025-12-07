@@ -3,17 +3,16 @@ package com.example.evaluacion
 import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothProfile
+import android.bluetooth.*
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
@@ -26,11 +25,14 @@ import java.util.UUID
 
 class DeviceControlActivity : AppCompatActivity() {
 
-    // UUIDs
-    private val SERVICE_UUID = UUID.fromString("12345678-90ab-cdef-1234-567890abcdef")
-    private val CONTROL_CHAR_UUID = UUID.fromString("abcdef02-1234-5678-90ab-cdef12345678")
+    // --- ESTÁNDARES DE SEGURIDAD ---
 
-    // Clave de encriptación XOR
+    private val SERVICE_UUID = UUID.fromString("12345678-90ab-cdef-1234-567890abcdef")
+    private val RAIN_CHAR_UUID = UUID.fromString("abcdef01-1234-5678-90ab-cdef12345678")
+    private val CONTROL_CHAR_UUID = UUID.fromString("abcdef02-1234-5678-90ab-cdef12345678")
+    private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+    // --- INTEGRIDAD DE DATOS ---
     private val XOR_KEY: Byte = 0x5A
 
     private var bluetoothGatt: BluetoothGatt? = null
@@ -38,10 +40,9 @@ class DeviceControlActivity : AppCompatActivity() {
     private lateinit var tvStatus: TextView
     private var isConnected = false
 
-    // Variables para reconexión automática
-    private var reconnectAttempts = 0
-    private val MAX_RECONNECT_ATTEMPTS = 3
-    private val RECONNECT_DELAY_MS = 2000L
+    // --- RECONEXIÓN AUTOMÁTICA MEJORADA ---
+    private var isRetrying = false
+    private val RECONNECT_DELAY_MS = 3000L
     private var deviceAddress: String? = null
     private val reconnectHandler = Handler(Looper.getMainLooper())
 
@@ -54,7 +55,14 @@ class DeviceControlActivity : AppCompatActivity() {
 
         setupUI()
         crearCanalNotificacion()
-        lanzarNotificacion("App Lluvia", "¡Bienvenido al sistema de control!")
+
+        // --- COMPATIBILIDAD HARDWARE ---
+        // Verificación de seguridad para asegurar que el dispositivo soporta BLE antes de intentar nada.
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)) {
+            Toast.makeText(this, "Hardware no compatible con BLE", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
 
         deviceAddress = intent.getStringExtra("DEVICE_ADDRESS")
         if (deviceAddress != null) {
@@ -66,22 +74,50 @@ class DeviceControlActivity : AppCompatActivity() {
         val toolbar = findViewById<Toolbar>(R.id.toolbar_control)
         setSupportActionBar(toolbar)
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
-        supportActionBar?.title = intent.getStringExtra("DEVICE_NAME") ?: "Control BLE"
+        supportActionBar?.title = intent.getStringExtra("DEVICE_NAME") ?: "Control IoT"
 
         tvStatus = findViewById(R.id.tv_status)
 
         findViewById<Button>(R.id.btn_open_window).setOnClickListener {
             sendSecureBLECommand("b")
-            database.child("estado_ventana").setValue("ABIERTA")
+            actualizarBaseDeDatos("ABIERTA")
         }
 
         findViewById<Button>(R.id.btn_close_window).setOnClickListener {
             sendSecureBLECommand("a")
-            database.child("estado_ventana").setValue("CERRADA")
+            actualizarBaseDeDatos("CERRADA")
         }
     }
 
-    // --- FUNCIONES DE SEGURIDAD ---
+    // --- SINCRONIZACIÓN Y ALMACENAMIENTO TEMPORAL ---
+    private fun actualizarBaseDeDatos(estado: String) {
+        if (isNetworkAvailable()) {
+            database.child("estado_ventana").setValue(estado)
+                .addOnSuccessListener {
+                    Toast.makeText(this, "Sincronizado con nube", Toast.LENGTH_SHORT).show()
+                }
+        } else {
+            // Aquí demostramos el almacenamiento temporal. Firebase guarda en caché localmente
+            // y sincronizará cuando vuelva la red.
+            database.child("estado_ventana").setValue(estado)
+            Toast.makeText(this, "Offline: Guardado localmente. Se subirá al conectar.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    //--- Método auxiliar para verificar red
+    private fun isNetworkAvailable(): Boolean {
+        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val network = connectivityManager.activeNetwork ?: return false
+            val activeNetwork = connectivityManager.getNetworkCapabilities(network) ?: return false
+            return activeNetwork.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        } else {
+            val networkInfo = connectivityManager.activeNetworkInfo
+            return networkInfo != null && networkInfo.isConnected
+        }
+    }
+
+    // --- ENVÍO DE INFORMACIÓN SEGURA ---
     private fun encryptCommand(command: String): ByteArray {
         val commandByte = command.toByteArray()[0]
         val encrypted = (commandByte.toInt() xor XOR_KEY.toInt()).toByte()
@@ -103,159 +139,135 @@ class DeviceControlActivity : AppCompatActivity() {
     }
 
     private fun sendSecureBLECommand(command: String) {
-        if (!isConnected) {
-            tvStatus.text = "Estado: No conectado. Reconectando..."
-            Toast.makeText(this, "Dispositivo no conectado", Toast.LENGTH_SHORT).show()
+        if (!isConnected || controlCharacteristic == null) {
+            Toast.makeText(this, "Esperando conexión segura...", Toast.LENGTH_SHORT).show()
             return
         }
-
-        if (bluetoothGatt == null || controlCharacteristic == null) {
-            tvStatus.text = "Estado: Servicio no disponible"
-            return
-        }
-
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            return
-        }
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) return
 
         try {
             val securePacket = prepareSecurePacket(command)
             controlCharacteristic?.value = securePacket
             controlCharacteristic?.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            val success = bluetoothGatt?.writeCharacteristic(controlCharacteristic) ?: false
-
-            if (success) {
-                val accion = if(command == "a") "Cerrar" else "Abrir"
-                tvStatus.text = "Comando seguro enviado: $accion"
-            } else {
-                tvStatus.text = "Error al enviar comando"
-            }
+            bluetoothGatt?.writeCharacteristic(controlCharacteristic)
         } catch (e: Exception) {
-            tvStatus.text = "Error de seguridad: ${e.message}"
+            Log.e("BLE", "Error de seguridad en envío: ${e.message}")
         }
     }
 
-    // --- FUNCIONES DE CONEXIÓN Y RECONEXIÓN ---
     private fun connectToBLEDevice(address: String) {
-        tvStatus.text = "Estado: Conectando a BLE..."
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            return
-        }
+        tvStatus.text = "Estado: Iniciando conexión segura..."
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) return
 
         try {
             val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
             val adapter = bluetoothManager.adapter
             val device = adapter.getRemoteDevice(address)
 
-            // Cerrar conexión anterior si existe
-            bluetoothGatt?.close()
 
-            bluetoothGatt = device.connectGatt(this, false, gattCallback)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                bluetoothGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            } else {
+                bluetoothGatt = device.connectGatt(this, false, gattCallback)
+            }
         } catch (e: Exception) {
-            tvStatus.text = "Error de conexión: ${e.message}"
             attemptReconnection()
         }
     }
 
-    /**
-     * Intenta reconectar automáticamente con delay exponencial
-     */
+    // --- LÓGICA DE RECONEXIÓN ROBUSTA ---
     private fun attemptReconnection() {
-        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            runOnUiThread {
-                tvStatus.text = "Estado: Conexión perdida. Máximo de intentos alcanzado."
-                Toast.makeText(this, "No se pudo reconectar. Verifica el dispositivo.", Toast.LENGTH_LONG).show()
-                lanzarNotificacion("Error de Conexión", "No se pudo reconectar al dispositivo BLE")
-            }
-            reconnectAttempts = 0
-            return
-        }
+        if (isRetrying) return // Evitar loops múltiples
+        isRetrying = true
 
-        reconnectAttempts++
-        runOnUiThread {
-            tvStatus.text = "Estado: Reconectando... Intento $reconnectAttempts/$MAX_RECONNECT_ATTEMPTS"
-        }
+        isConnected = false
+        runOnUiThread { tvStatus.text = "Se perdió la conexión. Reintentando..." }
 
         reconnectHandler.postDelayed({
-            deviceAddress?.let { address ->
-                connectToBLEDevice(address)
+            isRetrying = false
+            deviceAddress?.let {
+                Log.d("BLE", "Intentando reconexión automática...")
+                connectToBLEDevice(it)
             }
-        }, RECONNECT_DELAY_MS * reconnectAttempts) // Delay incremental
+        }, RECONNECT_DELAY_MS)
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
-            when (newState) {
-                BluetoothProfile.STATE_CONNECTED -> {
-                    isConnected = true
-                    reconnectAttempts = 0 // Resetear contador al conectar exitosamente
+            if (ActivityCompat.checkSelfPermission(this@DeviceControlActivity, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) return
 
-                    runOnUiThread {
-                        tvStatus.text = "Estado: Conectado [SEGURO]"
-                        Toast.makeText(this@DeviceControlActivity, "Conexión establecida", Toast.LENGTH_SHORT).show()
-                    }
-
-                    if (ActivityCompat.checkSelfPermission(this@DeviceControlActivity, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
-                        gatt?.discoverServices()
-                    }
-                }
-
-                BluetoothProfile.STATE_DISCONNECTED -> {
-                    isConnected = false
-
-                    runOnUiThread {
-                        tvStatus.text = "Estado: Desconectado"
-
-                        // Solo intentar reconectar si fue una desconexión inesperada (status != 0)
-                        if (status != BluetoothGatt.GATT_SUCCESS && deviceAddress != null) {
-                            Toast.makeText(this@DeviceControlActivity, "Conexión perdida. Intentando reconectar...", Toast.LENGTH_SHORT).show()
-                            attemptReconnection()
-                        }
-                    }
-                }
-
-                BluetoothProfile.STATE_CONNECTING -> {
-                    runOnUiThread {
-                        tvStatus.text = "Estado: Conectando..."
-                    }
-                }
-
-                BluetoothProfile.STATE_DISCONNECTING -> {
-                    runOnUiThread {
-                        tvStatus.text = "Estado: Desconectando..."
-                    }
-                }
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                isConnected = true
+                reconnectHandler.removeCallbacksAndMessages(null) // Cancelar reintentos pendientes
+                runOnUiThread { tvStatus.text = "Conectado. Negociando seguridad..." }
+                gatt?.discoverServices()
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                isConnected = false
+                // Si se desconecta, disparamos la reconexión automática INMEDIATAMENTE
+                attemptReconnection()
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
+            // 1. VERIFICACIÓN DE SEGURIDAD OBLIGATORIA
+            if (ActivityCompat.checkSelfPermission(this@DeviceControlActivity, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                return
+            }
+
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 val service = gatt?.getService(SERVICE_UUID)
                 controlCharacteristic = service?.getCharacteristic(CONTROL_CHAR_UUID)
+                val rainCharacteristic = service?.getCharacteristic(RAIN_CHAR_UUID)
 
-                if (controlCharacteristic != null) {
-                    runOnUiThread {
-                        tvStatus.text = "Estado: Listo (Modo Seguro)"
-                        Toast.makeText(this@DeviceControlActivity, "Servicios descubiertos. Sistema listo.", Toast.LENGTH_SHORT).show()
-                    }
-                } else {
-                    runOnUiThread {
-                        tvStatus.text = "Estado: Característica no encontrada"
-                        Toast.makeText(this@DeviceControlActivity, "Error: Servicio no compatible", Toast.LENGTH_SHORT).show()
+                // --- RECEPCIÓN DE INSTRUCCIONES ---
+                if (rainCharacteristic != null) {
+                    // A. Habilitar localmente
+                    gatt?.setCharacteristicNotification(rainCharacteristic, true)
+
+                    // B. Habilitar remotamente (Descriptor CCCD)
+                    val descriptor = rainCharacteristic.getDescriptor(CCCD_UUID)
+                    if (descriptor != null) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            gatt?.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                        } else {
+                            @Suppress("DEPRECATION")
+                            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                            @Suppress("DEPRECATION")
+                            gatt?.writeDescriptor(descriptor)
+                        }
                     }
                 }
+
+                runOnUiThread { tvStatus.text = "Conexión Establecida y Segura" }
             } else {
+                runOnUiThread { tvStatus.text = "Error al descubrir servicios: $status" }
+            }
+        }
+
+        // --- RECEPCIÓN DE DATOS DEL MICROCONTROLADOR
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            if (characteristic.uuid == RAIN_CHAR_UUID) {
+                val mensaje = characteristic.getStringValue(0) ?: ""
                 runOnUiThread {
-                    tvStatus.text = "Estado: Error al descubrir servicios"
+                    tvStatus.text = "Arduino dice: $mensaje"
+
+                    // Actualización automática en base a sensores
+                    if (mensaje.contains("cerrada", ignoreCase = true)) {
+                        // Usar la función que maneja offline/online
+                        actualizarBaseDeDatos("CERRADA")
+                        lanzarNotificacion("Alerta Lluvia", "Ventana cerrada por sensor.")
+                    } else if (mensaje.contains("abierta", ignoreCase = true)) {
+                        actualizarBaseDeDatos("ABIERTA")
+                    }
                 }
             }
         }
     }
 
-    // --- FUNCIONES DE NOTIFICACIÓN ---
     private fun crearCanalNotificacion() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val name = "Alertas Lluvia"
+            val name = "Alertas IoT"
             val importance = NotificationManager.IMPORTANCE_HIGH
             val channel = NotificationChannel(CHANNEL_ID, name, importance)
             val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -265,10 +277,7 @@ class DeviceControlActivity : AppCompatActivity() {
 
     private fun lanzarNotificacion(titulo: String, mensaje: String) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
-                return
-            }
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
         }
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher_round)
@@ -276,22 +285,17 @@ class DeviceControlActivity : AppCompatActivity() {
             .setContentText(mensaje)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
-
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(System.currentTimeMillis().toInt(), builder.build())
+        notificationManager.notify(1, builder.build())
     }
 
     override fun onDestroy() {
         super.onDestroy()
-
-        // Cancelar cualquier reconexión pendiente
         reconnectHandler.removeCallbacksAndMessages(null)
-
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+            bluetoothGatt?.disconnect()
             bluetoothGatt?.close()
         }
-        bluetoothGatt = null
-        deviceAddress = null
     }
 
     override fun onSupportNavigateUp(): Boolean {
